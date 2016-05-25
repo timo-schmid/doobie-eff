@@ -16,9 +16,11 @@ import scala.concurrent.duration._
 class DoobieEffSpec extends Specification { def is = s2"""
 
   Tasks produced by doobie can be added to a stack of effects:
-    - with a transaction for each query           $effStackTest
-    - with a single transaction for all queries   $effTxStackTest
-    - with a query that crashes                   $effCrash
+    - with a transaction for each query                       $effStackTest
+    - with a single transaction for all queries               $effTxStackTest
+    - with a query that crashes                               $effCrash
+    - with a full application stack                           $effFullStack
+    - report validation errors with a full application stack  $effFullStackValidationError
 
 """
 
@@ -167,6 +169,51 @@ class DoobieEffSpec extends Specification { def is = s2"""
       .run.isLeft ==== true
 
   }
+
+  object FullStack {
+
+    type Stack = Reader[Args, ?] |: Validate[String, ?] |: Task |: NoEffect
+    type S = Stack // shorthand
+
+    private val doobieProgram: Eff[S, Option[Todo]] = for {
+      args   <- ask[S, Args]
+      _      <- ValidateEffect.validateCheck[S, String](args.dbName.nonEmpty, "db name must not be empty")
+      _      <- ValidateEffect.validateCheck[S, String](args.topic.nonEmpty, "topic must not be empty")
+      xa     <- doTask[S, Transactor[Task]](createTransactor(args.dbName))
+      todo   <- doTask[S, Option[Todo]](singleTransaction(args.topic).transact(xa))
+    } yield todo
+
+    def runStack(args: Args) =
+      FullStack.doobieProgram
+        .runReader(args)
+        .runNel
+        .attemptTask(1.second)
+        .run
+
+  }
+
+  def effFullStack = {
+
+    val args = Args(
+      "eff_validate",
+      "Use EFF to run one single transaction for all queries"
+    )
+
+    FullStack.runStack(args) ==== \/.right(\/.right(Some(Todo(1, args.topic, true))))
+
+  }
+
+  def effFullStackValidationError = {
+
+    val args = Args(
+      "",
+      ""
+    )
+
+    FullStack.runStack(args) ==== \/.right(\/.left(NonEmptyList("db name must not be empty", "topic must not be empty")))
+      
+  }
+
 
 }
 
