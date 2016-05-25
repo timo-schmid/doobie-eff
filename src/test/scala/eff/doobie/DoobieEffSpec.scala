@@ -3,6 +3,9 @@ package eff.doobie
 import org.specs2.Specification
 import scalaz._
 import scalaz.Scalaz._
+import argonaut._
+import argonaut.Argonaut._
+import argonaut.ArgonautScalaz._
 import scalaz.concurrent.Task
 import org.atnos.eff._
 import org.atnos.eff.all._
@@ -21,15 +24,20 @@ class DoobieEffSpec extends Specification { def is = s2"""
     - with a query that crashes                               $effCrash
     - with a full application stack                           $effFullStack
     - report validation errors with a full application stack  $effFullStackValidationError
+    - parse json                                              $effFullStackParserError
 
 """
 
   // arguments for the programs
-  case class Args(dbName: String, topic: String)
+  case class Args(dbName: String, topic: String, json: String)
 
   // our datatype for the database
 
   case class Todo(id: Int, topic: String, done: Boolean)
+
+  // for argonaut
+
+  implicit def TodoCodecJson: CodecJson[Todo] = casecodec3(Todo.apply, Todo.unapply)("id", "topic", "done")
 
   // the db operations
 
@@ -110,7 +118,8 @@ class DoobieEffSpec extends Specification { def is = s2"""
 
     val args = Args(
       "eff_many_tx",
-      "Use EFF to run one transaction for each query"
+      "Use EFF to run one transaction for each query",
+      ""
     )
 
     doobieProgram
@@ -135,7 +144,8 @@ class DoobieEffSpec extends Specification { def is = s2"""
 
     val args = Args(
       "eff_single_tx",
-      "Use EFF to run one single transaction for all queries"
+      "Use EFF to run one single transaction for all queries",
+      ""
     )
 
     doobieProgram
@@ -160,7 +170,8 @@ class DoobieEffSpec extends Specification { def is = s2"""
 
     val args = Args(
       "eff_crash",
-      "Use EFF to run query which crashes, to demonstrate error handling"
+      "Use EFF to run query which crashes, to demonstrate error handling",
+      ""
     )
 
     doobieProgram
@@ -172,13 +183,16 @@ class DoobieEffSpec extends Specification { def is = s2"""
 
   object FullStack {
 
-    type Stack = Reader[Args, ?] |: Validate[String, ?] |: Task |: NoEffect
+    type Stack = Reader[Args, ?] |: Disjunction[String, ?] |: Validate[String, ?] |: Task |: NoEffect
     type S = Stack // shorthand
+
+    val jsonTopic = """ { "id": 1, "topic": "Clean my room", "done": false } """
 
     private val doobieProgram: Eff[S, Option[Todo]] = for {
       args   <- ask[S, Args]
-      _      <- ValidateEffect.validateCheck[S, String](args.dbName.nonEmpty, "db name must not be empty")
-      _      <- ValidateEffect.validateCheck[S, String](args.topic.nonEmpty, "topic must not be empty")
+      topic  <- fromDisjunction[S, String, Todo](\/.fromEither(Parse.decodeEither[Todo](args.json)))
+      _      <- validateCheck[S, String](args.dbName.nonEmpty, "db name must not be empty")
+      _      <- validateCheck[S, String](args.topic.nonEmpty, "topic must not be empty")
       xa     <- doTask[S, Transactor[Task]](createTransactor(args.dbName))
       todo   <- doTask[S, Option[Todo]](singleTransaction(args.topic).transact(xa))
     } yield todo
@@ -186,6 +200,7 @@ class DoobieEffSpec extends Specification { def is = s2"""
     def runStack(args: Args) =
       FullStack.doobieProgram
         .runReader(args)
+        .runDisjunction
         .runNel
         .attemptTask(1.second)
         .run
@@ -194,26 +209,45 @@ class DoobieEffSpec extends Specification { def is = s2"""
 
   def effFullStack = {
 
+    import FullStack._
+
     val args = Args(
       "eff_validate",
-      "Use EFF to run one single transaction for all queries"
+      "Use EFF to run one single transaction for all queries",
+      jsonTopic
     )
 
-    FullStack.runStack(args) ==== \/.right(\/.right(Some(Todo(1, args.topic, true))))
-
+    runStack(args) ==== \/.right(\/.right(\/.right(Some(Todo(1, args.topic, true)))))
+ 
   }
 
   def effFullStackValidationError = {
 
+    import FullStack._
+
     val args = Args(
       "",
-      ""
+      "",
+      jsonTopic // pass the topic json, so the json parsing doesn't fail
     )
 
-    FullStack.runStack(args) ==== \/.right(\/.left(NonEmptyList("db name must not be empty", "topic must not be empty")))
+    runStack(args) ==== \/.right(\/.left(NonEmptyList("db name must not be empty", "topic must not be empty")))
       
   }
 
+  def effFullStackParserError = {
+
+    import FullStack._
+
+    val args = Args(
+      "",
+      "",
+      " NOT VALID JSON "
+    )
+
+    runStack(args) ==== \/.right(\/.right(\/.left("Unexpected content found: NOT VALID JSON ")))
+        
+  }
 
 }
 
